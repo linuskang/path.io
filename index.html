@@ -3,45 +3,42 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Path.io – Smoothed GPS Tracker</title>
+<title>Path.io – Proper GPS Tracker</title>
 
 <script src="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.js"></script>
 <link href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css" rel="stylesheet"/>
 
 <style>
-body {
-    margin: 0;
-    font-family: Arial, sans-serif;
-}
-#map {
-    position: absolute;
-    inset: 0;
-}
+body { margin:0; font-family:Arial,sans-serif; }
+#map { position:absolute; inset:0; }
+
 #info {
-    position: absolute;
-    top: 10px;
-    left: 10px;
-    background: white;
-    padding: 12px;
-    border-radius: 8px;
-    box-shadow: 0 2px 6px rgba(0,0,0,0.3);
-    z-index: 2;
-    width: 280px;
+    position:absolute;
+    top:10px; left:10px;
+    background:white;
+    padding:12px;
+    border-radius:8px;
+    box-shadow:0 2px 6px rgba(0,0,0,.25);
+    z-index:2;
+    width:280px;
+    font-size:14px;
 }
-#info h3 {
-    margin: 0 0 8px;
+
+#info h3 { margin:0 0 8px; }
+
+.stat { margin:4px 0; }
+
+button {
+    width:100%;
+    margin-top:6px;
+    padding:6px;
+    cursor:pointer;
 }
-.stat {
-    font-size: 14px;
-    margin: 4px 0;
-}
-.gps-arrow {
-    width: 0;
-    height: 0;
-    border-left: 8px solid transparent;
-    border-right: 8px solid transparent;
-    border-bottom: 16px solid #1976d2;
-    transform-origin: center;
+
+/* SVG marker container */
+.gps-marker {
+    width:32px;
+    height:32px;
 }
 </style>
 </head>
@@ -49,169 +46,174 @@ body {
 
 <div id="info">
     <h3>Path.io Tracker</h3>
-    <div id="status">Requesting location permission…</div>
-    <div class="stat" id="points">Points: 0</div>
+    <div id="status">Waiting for GPS…</div>
+    <div class="stat" id="time">⏱ Time: 0s</div>
+    <div class="stat" id="distance">📏 Distance: 0 m</div>
+    <div class="stat" id="speed">🚀 Speed: 0 km/h</div>
+    <div class="stat" id="heading">🧭 Heading: –</div>
+    <button id="toggle">Pause Tracking</button>
 </div>
 
 <div id="map"></div>
 
 <script>
+/* ---------------- Map ---------------- */
 const map = new maplibregl.Map({
     container: 'map',
     style: {
-        version: 8,
-        sources: {
-            osm: {
-                type: 'raster',
-                tiles: [
+        version:8,
+        sources:{
+            osm:{
+                type:'raster',
+                tiles:[
                     'https://a.tile.openstreetmap.org/{z}/{x}/{y}.png',
                     'https://b.tile.openstreetmap.org/{z}/{x}/{y}.png',
                     'https://c.tile.openstreetmap.org/{z}/{x}/{y}.png'
                 ],
-                tileSize: 256
+                tileSize:256
             }
         },
-        layers: [{
-            id: 'osm',
-            type: 'raster',
-            source: 'osm'
-        }]
+        layers:[{ id:'osm', type:'raster', source:'osm' }]
     },
-    center: [0, 0],
-    zoom: 2
+    center:[0,0],
+    zoom:2
 });
 
 map.addControl(new maplibregl.NavigationControl(), 'top-right');
 
+/* ---------------- State ---------------- */
 let rawCoords = [];
-let marker = null;
 let watchId = null;
+let marker = null;
+let tracking = true;
 
-/* ---------- Moving Average Smoothing ---------- */
-function smoothCoordinates(coords, windowSize = 5) {
-    if (coords.length < windowSize) return coords;
+let lastPoint = null;
+let totalDistance = 0;
+let startTime = Date.now();
 
-    const smoothed = [];
-    for (let i = 0; i < coords.length; i++) {
-        const start = Math.max(0, i - windowSize + 1);
-        const slice = coords.slice(start, i + 1);
+/* ---------------- Utils ---------------- */
+function haversine(a, b) {
+    const R = 6371000;
+    const toRad = d => d * Math.PI / 180;
+    const dLat = toRad(b.lat - a.lat);
+    const dLon = toRad(b.lon - a.lon);
 
-        let sumLon = 0;
-        let sumLat = 0;
+    const h =
+        Math.sin(dLat/2)**2 +
+        Math.cos(toRad(a.lat)) *
+        Math.cos(toRad(b.lat)) *
+        Math.sin(dLon/2)**2;
 
-        for (const c of slice) {
-            sumLon += c[0];
-            sumLat += c[1];
-        }
-
-        smoothed.push([
-            sumLon / slice.length,
-            sumLat / slice.length
-        ]);
-    }
-    return smoothed;
+    return 2 * R * Math.asin(Math.sqrt(h));
 }
 
-/* ---------- Map Load ---------- */
+function smooth(coords, windowSize = 5) {
+    if (coords.length < windowSize) return coords;
+
+    return coords.map((_, i) => {
+        const slice = coords.slice(Math.max(0, i - windowSize + 1), i + 1);
+        const avg = slice.reduce((a,c) => [a[0]+c[0], a[1]+c[1]], [0,0]);
+        return [avg[0]/slice.length, avg[1]/slice.length];
+    });
+}
+
+/* ---------------- SVG Marker ---------------- */
+function createArrow() {
+    const div = document.createElement('div');
+    div.className = 'gps-marker';
+    div.innerHTML = `
+    <svg viewBox="0 0 100 100">
+        <path d="M50 5 L90 95 L50 75 L10 95 Z"
+              fill="#1976d2"/>
+        <circle cx="50" cy="50" r="6" fill="white"/>
+    </svg>`;
+    return div;
+}
+
+/* ---------------- Map Load ---------------- */
 map.on('load', () => {
     map.addSource('path', {
-        type: 'geojson',
-        data: {
-            type: 'Feature',
-            geometry: {
-                type: 'LineString',
-                coordinates: []
-            }
-        }
+        type:'geojson',
+        data:{ type:'Feature', geometry:{ type:'LineString', coordinates:[] } }
     });
 
     map.addLayer({
-        id: 'path-line',
-        type: 'line',
-        source: 'path',
-        layout: {
-            'line-join': 'round',
-            'line-cap': 'round'
-        },
-        paint: {
-            'line-color': '#1976d2',
-            'line-width': 4,
-            'line-opacity': 0.85
-        }
+        id:'path-line',
+        type:'line',
+        source:'path',
+        layout:{ 'line-join':'round', 'line-cap':'round' },
+        paint:{ 'line-color':'#1976d2', 'line-width':4 }
     });
 
     startTracking();
 });
 
-/* ---------- Tracking ---------- */
+/* ---------------- Tracking ---------------- */
 function startTracking() {
-    if (!navigator.geolocation) {
-        setStatus('Geolocation not supported');
-        return;
-    }
+    watchId = navigator.geolocation.watchPosition(pos => {
+        if (!tracking) return;
 
-    watchId = navigator.geolocation.watchPosition(
-        pos => {
-            const { latitude, longitude, heading } = pos.coords;
+        const { latitude, longitude, speed, heading } = pos.coords;
+        const current = { lat: latitude, lon: longitude };
 
-            rawCoords.push([longitude, latitude]);
-
-            const smoothed = smoothCoordinates(rawCoords, 5);
-
-            map.getSource('path').setData({
-                type: 'Feature',
-                geometry: {
-                    type: 'LineString',
-                    coordinates: smoothed
-                }
-            });
-
-            if (!marker) {
-                const arrow = document.createElement('div');
-                arrow.className = 'gps-arrow';
-
-                marker = new maplibregl.Marker({
-                    element: arrow,
-                    rotationAlignment: 'map'
-                })
-                .setLngLat([longitude, latitude])
-                .addTo(map);
-
-                map.flyTo({
-                    center: [longitude, latitude],
-                    zoom: 16
-                });
-            } else {
-                marker.setLngLat([longitude, latitude]);
-            }
-
-            if (heading !== null && marker) {
-                marker.setRotation(heading);
-            }
-
-            document.getElementById('points').textContent =
-                `Points: ${rawCoords.length}`;
-            setStatus('Tracking active');
-
-        },
-        err => setStatus(err.message),
-        {
-            enableHighAccuracy: true,
-            maximumAge: 0
+        if (lastPoint) {
+            const d = haversine(lastPoint, current);
+            if (d < 50) totalDistance += d; // noise filter
         }
-    );
+
+        lastPoint = current;
+        rawCoords.push([longitude, latitude]);
+
+        const smoothed = smooth(rawCoords, 5);
+        map.getSource('path').setData({
+            type:'Feature',
+            geometry:{ type:'LineString', coordinates: smoothed }
+        });
+
+        if (!marker) {
+            marker = new maplibregl.Marker({
+                element: createArrow(),
+                rotationAlignment: 'map'
+            })
+            .setLngLat([longitude, latitude])
+            .addTo(map);
+
+            map.flyTo({ center:[longitude, latitude], zoom:16 });
+        } else {
+            marker.setLngLat([longitude, latitude]);
+        }
+
+        if (heading !== null) {
+            marker.setRotation(heading);
+            document.getElementById('heading').textContent =
+                `🧭 Heading: ${Math.round(heading)}°`;
+        }
+
+        updateStats(speed);
+    });
 }
 
-function setStatus(msg) {
-    document.getElementById('status').textContent = msg;
+/* ---------------- UI ---------------- */
+function updateStats(speed) {
+    const elapsed = Math.floor((Date.now() - startTime) / 1000);
+
+    document.getElementById('time').textContent =
+        `⏱ Time: ${elapsed}s`;
+
+    document.getElementById('distance').textContent =
+        `📏 Distance: ${totalDistance.toFixed(1)} m`;
+
+    document.getElementById('speed').textContent =
+        `🚀 Speed: ${speed ? (speed * 3.6).toFixed(1) : 0} km/h`;
+
+    document.getElementById('status').textContent = 'Tracking active';
 }
 
-/* ---------- Cleanup ---------- */
-window.addEventListener('beforeunload', () => {
-    if (watchId !== null) {
-        navigator.geolocation.clearWatch(watchId);
-    }
-});
+document.getElementById('toggle').onclick = () => {
+    tracking = !tracking;
+    document.getElementById('toggle').textContent =
+        tracking ? 'Pause Tracking' : 'Resume Tracking';
+};
 </script>
 
 </body>
