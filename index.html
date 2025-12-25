@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Path.io - Location Tracker</title>
+    <script src="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.js"></script>
+    <link href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css" rel="stylesheet" />
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: Arial, sans-serif;
+        }
+        #map {
+            position: absolute;
+            top: 0;
+            bottom: 0;
+            width: 100%;
+        }
+        #info {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: white;
+            padding: 10px;
+            border-radius: 5px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.3);
+            z-index: 1;
+            max-width: 300px;
+        }
+        #status {
+            margin-top: 5px;
+            font-size: 14px;
+            color: #666;
+        }
+        .error {
+            color: #d32f2f;
+        }
+        .success {
+            color: #388e3c;
+        }
+    </style>
+</head>
+<body>
+    <div id="info">
+        <h3 style="margin: 0 0 10px 0;">Path.io Location Tracker</h3>
+        <div id="status">Click "Allow" to start tracking your location</div>
+    </div>
+    <div id="map"></div>
+
+    <script>
+        // Initialize the map
+        const map = new maplibregl.Map({
+            container: 'map',
+            style: {
+                version: 8,
+                sources: {
+                    'osm': {
+                        type: 'raster',
+                        tiles: [
+                            'https://a.tile.openstreetmap.org/{z}/{x}/{y}.png',
+                            'https://b.tile.openstreetmap.org/{z}/{x}/{y}.png',
+                            'https://c.tile.openstreetmap.org/{z}/{x}/{y}.png'
+                        ],
+                        tileSize: 256,
+                        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+                    }
+                },
+                layers: [
+                    {
+                        id: 'osm',
+                        type: 'raster',
+                        source: 'osm',
+                        minzoom: 0,
+                        maxzoom: 19
+                    }
+                ]
+            },
+            center: [0, 0],
+            zoom: 2
+        });
+
+        // Array to store the path coordinates
+        let pathCoordinates = [];
+        let watchId = null;
+        let userMarker = null;
+
+        // Initialize navigation control
+        map.addControl(new maplibregl.NavigationControl(), 'top-right');
+
+        // Wait for map to load before adding sources and layers
+        map.on('load', function() {
+            // Add the GeoJSON source for the path line
+            map.addSource('path', {
+                type: 'geojson',
+                data: {
+                    type: 'Feature',
+                    properties: {},
+                    geometry: {
+                        type: 'LineString',
+                        coordinates: []
+                    }
+                }
+            });
+
+            // Add the layer to display the path
+            map.addLayer({
+                id: 'path-layer',
+                type: 'line',
+                source: 'path',
+                layout: {
+                    'line-join': 'round',
+                    'line-cap': 'round'
+                },
+                paint: {
+                    'line-color': '#3887be',
+                    'line-width': 4,
+                    'line-opacity': 0.8
+                }
+            });
+
+            // Start location tracking
+            startLocationTracking();
+        });
+
+        function updateStatus(message, isError = false) {
+            const statusElement = document.getElementById('status');
+            statusElement.textContent = message;
+            statusElement.className = isError ? 'error' : 'success';
+        }
+
+        function startLocationTracking() {
+            if (!navigator.geolocation) {
+                updateStatus('Geolocation is not supported by your browser', true);
+                return;
+            }
+
+            updateStatus('Requesting location permission...');
+
+            watchId = navigator.geolocation.watchPosition(
+                function(position) {
+                    const lon = position.coords.longitude;
+                    const lat = position.coords.latitude;
+                    const accuracy = position.coords.accuracy;
+
+                    // Add the new coordinate to the path
+                    pathCoordinates.push([lon, lat]);
+
+                    // Update the GeoJSON source with the new path
+                    map.getSource('path').setData({
+                        type: 'Feature',
+                        properties: {},
+                        geometry: {
+                            type: 'LineString',
+                            coordinates: pathCoordinates
+                        }
+                    });
+
+                    // Update or create the user location marker
+                    if (!userMarker) {
+                        userMarker = new maplibregl.Marker({
+                            color: '#3887be'
+                        })
+                        .setLngLat([lon, lat])
+                        .addTo(map);
+
+                        // Center the map on the user's location on first position
+                        map.flyTo({
+                            center: [lon, lat],
+                            zoom: 15,
+                            essential: true
+                        });
+                    } else {
+                        userMarker.setLngLat([lon, lat]);
+                    }
+
+                    // Update status
+                    const pointsCount = pathCoordinates.length;
+                    updateStatus(`Tracking: ${pointsCount} point${pointsCount !== 1 ? 's' : ''} recorded (±${Math.round(accuracy)}m accuracy)`);
+                },
+                function(error) {
+                    let errorMessage = 'Error getting location: ';
+                    switch(error.code) {
+                        case error.PERMISSION_DENIED:
+                            errorMessage += 'Permission denied. Please allow location access.';
+                            break;
+                        case error.POSITION_UNAVAILABLE:
+                            errorMessage += 'Position unavailable.';
+                            break;
+                        case error.TIMEOUT:
+                            errorMessage += 'Request timeout.';
+                            break;
+                        default:
+                            errorMessage += 'Unknown error.';
+                            break;
+                    }
+                    updateStatus(errorMessage, true);
+                },
+                {
+                    enableHighAccuracy: true,
+                    maximumAge: 0,
+                    timeout: 30000
+                }
+            );
+        }
+
+        // Clean up on page unload
+        window.addEventListener('beforeunload', function() {
+            if (watchId !== null) {
+                navigator.geolocation.clearWatch(watchId);
+            }
+        });
+    </script>
+</body>
+</html>
