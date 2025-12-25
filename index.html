@@ -3,36 +3,45 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Path.io – Advanced Tracker</title>
+<title>Path.io – Smoothed GPS Tracker</title>
 
 <script src="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.js"></script>
 <link href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css" rel="stylesheet"/>
 
 <style>
-body { margin:0; font-family:Arial,sans-serif; }
-#map { position:absolute; inset:0; }
-
-#info {
-    position:absolute;
-    top:10px; left:10px;
-    background:white;
-    padding:12px;
-    border-radius:8px;
-    box-shadow:0 2px 6px rgba(0,0,0,.25);
-    z-index:2;
-    width:280px;
-    font-size:14px;
+body {
+    margin: 0;
+    font-family: Arial, sans-serif;
 }
-
-#info h3 { margin:0 0 8px; }
-
-.stat { margin:4px 0; }
-
-button {
-    margin-top:6px;
-    width:100%;
-    padding:6px;
-    cursor:pointer;
+#map {
+    position: absolute;
+    inset: 0;
+}
+#info {
+    position: absolute;
+    top: 10px;
+    left: 10px;
+    background: white;
+    padding: 12px;
+    border-radius: 8px;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.3);
+    z-index: 2;
+    width: 280px;
+}
+#info h3 {
+    margin: 0 0 8px;
+}
+.stat {
+    font-size: 14px;
+    margin: 4px 0;
+}
+.gps-arrow {
+    width: 0;
+    height: 0;
+    border-left: 8px solid transparent;
+    border-right: 8px solid transparent;
+    border-bottom: 16px solid #1976d2;
+    transform-origin: center;
 }
 </style>
 </head>
@@ -40,12 +49,8 @@ button {
 
 <div id="info">
     <h3>Path.io Tracker</h3>
-    <div id="status">Waiting for permission…</div>
-    <div class="stat" id="time">⏱ Time: 0s</div>
-    <div class="stat" id="distance">📏 Distance: 0 m</div>
-    <div class="stat" id="speed">🚀 Speed: 0 km/h</div>
-    <div class="stat" id="heading">🧭 Heading: –</div>
-    <button id="toggle">Pause Tracking</button>
+    <div id="status">Requesting location permission…</div>
+    <div class="stat" id="points">Points: 0</div>
 </div>
 
 <div id="map"></div>
@@ -54,166 +59,160 @@ button {
 const map = new maplibregl.Map({
     container: 'map',
     style: {
-        version:8,
-        sources:{
-            osm:{
-                type:'raster',
-                tiles:[
+        version: 8,
+        sources: {
+            osm: {
+                type: 'raster',
+                tiles: [
                     'https://a.tile.openstreetmap.org/{z}/{x}/{y}.png',
                     'https://b.tile.openstreetmap.org/{z}/{x}/{y}.png',
                     'https://c.tile.openstreetmap.org/{z}/{x}/{y}.png'
                 ],
-                tileSize:256
+                tileSize: 256
             }
         },
-        layers:[{ id:'osm', type:'raster', source:'osm' }]
+        layers: [{
+            id: 'osm',
+            type: 'raster',
+            source: 'osm'
+        }]
     },
-    center:[0,0],
-    zoom:2
+    center: [0, 0],
+    zoom: 2
 });
 
 map.addControl(new maplibregl.NavigationControl(), 'top-right');
 
-let path = [];
-let watchId = null;
+let rawCoords = [];
 let marker = null;
-let accuracyCircle = null;
-let tracking = true;
+let watchId = null;
 
-let startTime = Date.now();
-let totalDistance = 0;
-let lastPoint = null;
+/* ---------- Moving Average Smoothing ---------- */
+function smoothCoordinates(coords, windowSize = 5) {
+    if (coords.length < windowSize) return coords;
 
+    const smoothed = [];
+    for (let i = 0; i < coords.length; i++) {
+        const start = Math.max(0, i - windowSize + 1);
+        const slice = coords.slice(start, i + 1);
+
+        let sumLon = 0;
+        let sumLat = 0;
+
+        for (const c of slice) {
+            sumLon += c[0];
+            sumLat += c[1];
+        }
+
+        smoothed.push([
+            sumLon / slice.length,
+            sumLat / slice.length
+        ]);
+    }
+    return smoothed;
+}
+
+/* ---------- Map Load ---------- */
 map.on('load', () => {
     map.addSource('path', {
-        type:'geojson',
-        data:{ type:'Feature', geometry:{ type:'LineString', coordinates:[] } }
+        type: 'geojson',
+        data: {
+            type: 'Feature',
+            geometry: {
+                type: 'LineString',
+                coordinates: []
+            }
+        }
     });
 
     map.addLayer({
-        id:'path-line',
-        type:'line',
-        source:'path',
-        paint:{
-            'line-color':'#1976d2',
-            'line-width':4
+        id: 'path-line',
+        type: 'line',
+        source: 'path',
+        layout: {
+            'line-join': 'round',
+            'line-cap': 'round'
+        },
+        paint: {
+            'line-color': '#1976d2',
+            'line-width': 4,
+            'line-opacity': 0.85
         }
     });
 
     startTracking();
 });
 
-function haversine(a, b) {
-    const R = 6371000;
-    const toRad = d => d * Math.PI / 180;
-    const dLat = toRad(b.lat - a.lat);
-    const dLon = toRad(b.lon - a.lon);
-
-    const h =
-        Math.sin(dLat/2)**2 +
-        Math.cos(toRad(a.lat)) *
-        Math.cos(toRad(b.lat)) *
-        Math.sin(dLon/2)**2;
-
-    return 2 * R * Math.asin(Math.sqrt(h));
-}
-
+/* ---------- Tracking ---------- */
 function startTracking() {
     if (!navigator.geolocation) {
-        status('Geolocation unsupported');
+        setStatus('Geolocation not supported');
         return;
     }
 
-    watchId = navigator.geolocation.watchPosition(pos => {
-        if (!tracking) return;
+    watchId = navigator.geolocation.watchPosition(
+        pos => {
+            const { latitude, longitude, heading } = pos.coords;
 
-        const { latitude, longitude, accuracy, heading, speed } = pos.coords;
+            rawCoords.push([longitude, latitude]);
 
-        const current = { lat: latitude, lon: longitude };
+            const smoothed = smoothCoordinates(rawCoords, 5);
 
-        if (lastPoint) {
-            const d = haversine(lastPoint, current);
+            map.getSource('path').setData({
+                type: 'Feature',
+                geometry: {
+                    type: 'LineString',
+                    coordinates: smoothed
+                }
+            });
 
-            // GPS noise filter (ignore jumps > 50m)
-            if (d < 50) {
-                totalDistance += d;
-                path.push([longitude, latitude]);
+            if (!marker) {
+                const arrow = document.createElement('div');
+                arrow.className = 'gps-arrow';
+
+                marker = new maplibregl.Marker({
+                    element: arrow,
+                    rotationAlignment: 'map'
+                })
+                .setLngLat([longitude, latitude])
+                .addTo(map);
+
+                map.flyTo({
+                    center: [longitude, latitude],
+                    zoom: 16
+                });
+            } else {
+                marker.setLngLat([longitude, latitude]);
             }
-        } else {
-            path.push([longitude, latitude]);
+
+            if (heading !== null && marker) {
+                marker.setRotation(heading);
+            }
+
+            document.getElementById('points').textContent =
+                `Points: ${rawCoords.length}`;
+            setStatus('Tracking active');
+
+        },
+        err => setStatus(err.message),
+        {
+            enableHighAccuracy: true,
+            maximumAge: 0
         }
-
-        lastPoint = current;
-
-        map.getSource('path').setData({
-            type:'Feature',
-            geometry:{ type:'LineString', coordinates:path }
-        });
-
-        if (!marker) {
-            marker = new maplibregl.Marker().setLngLat([longitude, latitude]).addTo(map);
-            map.flyTo({ center:[longitude, latitude], zoom:16 });
-        } else {
-            marker.setLngLat([longitude, latitude]);
-        }
-
-        updateAccuracyCircle(longitude, latitude, accuracy);
-
-        updateStats(speed, heading);
-
-    }, err => status(err.message), {
-        enableHighAccuracy:true,
-        maximumAge:0
-    });
+    );
 }
 
-function updateAccuracyCircle(lon, lat, accuracy) {
-    const circle = turf.circle([lon, lat], accuracy / 1000, { steps:32 });
-
-    if (!map.getSource('accuracy')) {
-        map.addSource('accuracy', { type:'geojson', data:circle });
-        map.addLayer({
-            id:'accuracy-fill',
-            type:'fill',
-            source:'accuracy',
-            paint:{ 'fill-color':'#1976d2', 'fill-opacity':0.15 }
-        });
-    } else {
-        map.getSource('accuracy').setData(circle);
-    }
-}
-
-function updateStats(speed, heading) {
-    const elapsed = Math.floor((Date.now() - startTime) / 1000);
-
-    document.getElementById('time').textContent =
-        `⏱ Time: ${elapsed}s`;
-
-    document.getElementById('distance').textContent =
-        `📏 Distance: ${totalDistance.toFixed(1)} m`;
-
-    document.getElementById('speed').textContent =
-        `🚀 Speed: ${speed ? (speed * 3.6).toFixed(1) : 0} km/h`;
-
-    document.getElementById('heading').textContent =
-        `🧭 Heading: ${heading !== null ? Math.round(heading) + '°' : '–'}`;
-
-    status('Tracking active');
-}
-
-function status(msg) {
+function setStatus(msg) {
     document.getElementById('status').textContent = msg;
 }
 
-document.getElementById('toggle').onclick = () => {
-    tracking = !tracking;
-    document.getElementById('toggle').textContent =
-        tracking ? 'Pause Tracking' : 'Resume Tracking';
-};
+/* ---------- Cleanup ---------- */
+window.addEventListener('beforeunload', () => {
+    if (watchId !== null) {
+        navigator.geolocation.clearWatch(watchId);
+    }
+});
 </script>
-
-<!-- Turf for accuracy circle math -->
-<script src="https://unpkg.com/@turf/turf@6/turf.min.js"></script>
 
 </body>
 </html>
